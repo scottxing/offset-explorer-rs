@@ -1,0 +1,313 @@
+<script lang="ts">
+  import { invoke } from '@tauri-apps/api';
+  import type {
+    ServerConnectionSettings,
+    TopicMetadata,
+    PartitionInfo,
+    ConsumerGroup
+  } from '../lib/types';
+
+  // State
+  let servers: ServerConnectionSettings[] = [];
+  let expandedServers: Set<number> = new Set();
+  let selectedServer: number | null = null;
+  let selectedTopic: string | null = null;
+  let serverStates: Map<number, string> = new Map();
+
+  // Fetch servers on mount
+  async function fetchServers() {
+    try {
+      const connections = await invoke<ServerConnectionSettings[]>('get_server_connections');
+      servers = connections;
+
+      // Auto-expand first server if only one
+      if (servers.length === 1) {
+        expandedServers.add(connections[0].id);
+      }
+
+      // Initialize server states
+      servers.forEach(s => {
+        if (s.status === 'connected') {
+          serverStates.set(s.id, 'connected');
+        }
+      });
+
+      console.log('Loaded servers:', connections);
+    } catch (error) {
+      console.error('Failed to load servers:', error);
+    }
+  }
+
+  // Connect to a server
+  async function connectToServer(id: number) {
+    try {
+      await invoke('connect_to_server', { id });
+      console.log('Connecting to server:', id);
+
+      // Refresh servers list after connection
+      await fetchServers();
+
+      // Set as selected
+      selectedServer = id;
+      selectedTopic = null;
+    } catch (error) {
+      console.error('Failed to connect to server:', error);
+    }
+  }
+
+  // Disconnect from server
+  async function disconnectFromServer(id: number) {
+    try {
+      await invoke('disconnect_from_server', { id });
+      console.log('Disconnecting from server:', id);
+
+      // Update state
+      serverStates.set(id, 'disconnected');
+
+      // Clear selection if disconnecting current server
+      if (selectedServer === id) {
+        selectedServer = null;
+        selectedTopic = null;
+      }
+
+      // Refresh servers list
+      await fetchServers();
+    } catch (error) {
+      console.error('Failed to disconnect from server:', error);
+    }
+  }
+
+  // Toggle server expansion
+  function toggleServerExpansion(id: number) {
+    if (expandedServers.has(id)) {
+      expandedServers.delete(id);
+    } else {
+      expandedServers.add(id);
+    }
+  }
+
+  // Fetch topics for a server
+  async function fetchTopics(serverId: number) {
+    try {
+      const topics = await invoke<string[]>('list_topics', { serverId });
+      console.log('Loaded topics for server:', serverId, topics);
+      return topics;
+    } catch (error) {
+      console.error('Failed to load topics:', error);
+      return [];
+    }
+  }
+
+  // Handle server selection
+  function selectServer(id: number) {
+    selectedServer = id;
+    selectedTopic = null;
+  }
+
+  // Handle topic selection
+  function selectTopic(topic: string) {
+    selectedTopic = topic;
+  }
+</script>
+
+<div class="tree-container">
+  <!-- Toolbar -->
+  <div class="toolbar">
+    <button on:click={fetchServers} title="Refresh">
+      ↻ Refresh
+    </button>
+  </div>
+
+  <!-- Server Tree -->
+  <div class="server-list">
+    {#if servers.length === 0}
+      <div class="empty-state">
+        <p>No servers configured. Click "Add Server" to create a new connection.</p>
+      </div>
+    {:else}
+      {#each servers as server (server)}
+        <div class="server-item" class:expanded={expandedServers.has(server.id)} on:click={() => selectServer(server.id)}>
+          <div class="server-header">
+            <span class="expand-icon">
+              {#if expandedServers.has(server.id)}
+                ▾
+              {:else}
+                ▸
+            </span>
+            <span class="server-name">{server.name}</span>
+            <span class="server-status" title={serverStates.get(server.id) ?? 'Unknown'}>
+              {#if serverStates.get(server.id) === 'connected'}
+                🟢 Connected
+              {:else}
+                ⚪ Disconnected
+            </span>
+            <button on:click={(e) => disconnectFromServer(server.id)} disabled={server.status !== 'connected'}>
+              Disconnect
+            </button>
+          </span>
+        </div>
+
+        {#if expandedServers.has(server.id)}
+          <ul class="topic-list">
+            {@const fetchTopics}
+            {#await fetchTopics(server.id)}
+              {#each await fetchTopics(server.id) as topic (topic)}
+                  <li class="topic-item" on:click={() => selectTopic(topic)}>
+                    <span class="topic-icon">📋</span>
+                    <span class="topic-name">{topic}</span>
+                  </li>
+              {/each}
+              </ul>
+        {/if}
+      </div>
+    {/each}
+  </div>
+
+  <!-- Server Info -->
+  {#if selectedServer !== null}
+    <div class="server-info">
+      <strong>Connected to:</strong> {selectedServer}
+      {#if selectedTopic !== null}
+        <div>Selected topic: <em>{selectedTopic}</em></div>
+      {/if}
+    </div>
+  {/if}
+</div>
+
+<style>
+  .tree-container {
+    font-family: system-ui, -apple-system, sans-serif;
+    height: 100vh;
+    display: flex;
+    flex-direction: column;
+  }
+
+  .toolbar {
+    padding: 8px;
+    border-bottom: 1px solid #e0e0e0;
+    background: #f5f5f5;
+  }
+
+  .toolbar button {
+    padding: 6px 12px;
+    background: #0366d6;
+    color: white;
+    border: none;
+    border-radius: 4px;
+    cursor: pointer;
+    font-size: 14px;
+  }
+
+  .toolbar button:hover {
+    background: #047857;
+  }
+
+  .server-list {
+    flex: 1;
+    overflow-y: auto;
+    border-right: 1px solid #e0e0e0;
+    background: white;
+  }
+
+  .server-item {
+    margin: 4px 0;
+    padding: 8px;
+    background: white;
+    border-radius: 6px;
+    transition: all 0.2s;
+    cursor: pointer;
+  }
+
+  .server-item:hover {
+    background: #f9fafb;
+  }
+
+  .server-header {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+  }
+
+  .expand-icon {
+    font-size: 12px;
+    transition: transform 0.2s;
+  }
+
+  .server-name {
+    font-weight: 500;
+    font-size: 14px;
+  }
+
+  .server-status {
+    padding: 4px 8px;
+    border-radius: 4px;
+    font-size: 12px;
+  }
+
+  .status-connected {
+    background: #10b981;
+    color: white;
+  }
+
+  .status-disconnected {
+    background: #ef4444;
+    color: white;
+  }
+
+  .status-unknown {
+    background: #6b7280;
+    color: white;
+  }
+
+  .topic-list {
+    list-style: none;
+    padding-left: 24px;
+    margin-top: 8px;
+  }
+
+  .topic-item {
+    padding: 6px 12px;
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    cursor: pointer;
+    border-radius: 4px;
+    transition: all 0.2s;
+  }
+
+  .topic-item:hover {
+    background: #f3f4f6;
+  }
+
+  .topic-icon {
+    font-size: 16px;
+  }
+
+  .topic-name {
+    font-size: 13px;
+  }
+
+  .server-item button {
+    margin-left: auto;
+    padding: 4px 12px;
+    background: #dc2626;
+    color: white;
+    border: none;
+    border-radius: 4px;
+    cursor: pointer;
+    font-size: 12px;
+  }
+
+  .server-item button:hover {
+    background: #b83333;
+  }
+
+  .empty-state {
+    flex: 1;
+    align-items: center;
+    justify-content: center;
+    padding: 48px;
+    color: #6b7280;
+    font-size: 14px;
+  }
+</style>

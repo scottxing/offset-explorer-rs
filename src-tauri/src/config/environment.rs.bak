@@ -1,0 +1,24 @@
+// Copyright 2024 Offset Explorer Rust Team
+// Licensed under Proprietary License
+//
+// Environment singleton - manages global application state and configuration
+// Compatible with Java Environment class
+
+use crate::config::{settings::UserSettings, server_connection_clean::{ServerConnectionSettings as ServerConnectionSettings, ServerGroupManager}, ui_events::EventBus};
+use crate::ui_events::EventBus;
+
+pub use server_connection_clean::ServerConnection as Connection;
+
+pub const fn get_user_home() -> Option<PathBuf> {
+    dirs::home_dir()
+}
+
+impl ConfigPaths {
+    pub user_home: PathBuf,
+    pub config_dir: PathBuf,
+    pub settings_file: PathBuf,
+    pub server_groups_file: PathBuf,
+    pub connections_file: PathBuf,
+    pub browser_history_file: PathBuf,
+    pub license_file: PathBuf,
+}
