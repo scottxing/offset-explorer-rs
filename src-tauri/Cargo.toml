@@ -40,7 +40,7 @@ reqwest = { version = "0.11", features = ["json", "rustls-tls"] }
 apache-avro = "0.16"
 # zookeeper-client = "0.5"  # Commented out - requires C library
 # Tauri GUI framework - enabled (GTK dev libraries installed)
-tauri = { version = "2.0", features = [] }
+tauri = { version = "2.0", features = ["devtools"] }
 tauri-build = { version = "2.0" }
 
 [profile.release]

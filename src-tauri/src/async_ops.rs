@@ -4,9 +4,10 @@
 // Background task manager with progress tracking
 
 use anyhow::Result;
+use serde::Serialize;
+use std::future::Future;
 use std::sync::{Arc, Mutex};
 use tokio::task::JoinHandle;
-use std::future::Future;
 
 /// Background task with progress tracking
 pub struct BackgroundTask {
@@ -16,7 +17,7 @@ pub struct BackgroundTask {
     handle: Option<JoinHandle<Result<()>>>,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize)]
 pub struct TaskProgress {
     pub current: usize,
     pub total: usize,

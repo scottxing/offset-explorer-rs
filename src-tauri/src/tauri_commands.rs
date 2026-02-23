@@ -4,27 +4,32 @@
 // Tauri command handlers
 // Bridges Rust backend with frontend UI
 
-use anyhow::{Result, anyhow};
+use anyhow::{anyhow, Result};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
-use std::sync::{Arc, Mutex};
 use std::sync::atomic::AtomicBool;
-use tracing::{info, debug, warn};
+use std::sync::{Arc, Mutex};
+use tauri::State;
+use tracing::{debug, info, warn};
 
-use crate::config::{ServerConnection, ServerConnectionSettings};
-use crate::kafka::mapper::{KafkaMapper, KafkaMessage};
+use crate::acls::{AclBinding, AclFilter, CreateAclRequest};
 use crate::async_ops::TaskManager;
-use crate::acls::{AclBinding, CreateAclRequest, AclFilter};
-use crate::schema_registry::client::{SchemaRegistryClient, SchemaInfo as SchemaInfoInternal, SchemaType};
+use crate::config::ServerConnection;
+use crate::kafka::mapper::{KafkaMapper, KafkaMessage};
+use crate::schema_registry::client::{SchemaInfo as SchemaInfoInternal, SchemaRegistryClient, SchemaType};
+
+// ==================== Application State ====================
 
 /// Global application state
 pub struct AppState {
     /// Connected Kafka mappers (server_id -> mapper)
     pub connections: Arc<Mutex<HashMap<i64, Arc<KafkaMapper>>>>,
-
+    /// Saved server configurations
+    pub server_configs: Arc<Mutex<Vec<ServerConnection>>>,
+    /// Next server ID
+    pub next_id: Arc<Mutex<i64>>,
     /// Task manager for background operations
     pub task_manager: Arc<TaskManager>,
-
     /// Flag indicating if shutdown is in progress
     pub is_shutting_down: Arc<AtomicBool>,
 }
@@ -33,33 +38,65 @@ impl AppState {
     pub fn new() -> Self {
         Self {
             connections: Arc::new(Mutex::new(HashMap::new())),
+            server_configs: Arc::new(Mutex::new(Vec::new())),
+            next_id: Arc::new(Mutex::new(1)),
             task_manager: Arc::new(TaskManager::new()),
             is_shutting_down: Arc::new(AtomicBool::new(false)),
         }
     }
 
-    /// Add a connection
     pub fn add_connection(&self, id: i64, mapper: Arc<KafkaMapper>) {
         let mut conns = self.connections.lock().unwrap();
         conns.insert(id, mapper);
         info!("Added connection ID {}", id);
     }
 
-    /// Remove a connection
     pub fn remove_connection(&self, id: i64) {
         let mut conns = self.connections.lock().unwrap();
         conns.remove(&id);
         info!("Removed connection ID {}", id);
     }
 
-    /// Get a connection
     pub fn get_connection(&self, id: i64) -> Option<Arc<KafkaMapper>> {
         let conns = self.connections.lock().unwrap();
         conns.get(&id).cloned()
     }
+
+    pub fn add_server_config(&self, config: ServerConnection) -> i64 {
+        let id = {
+            let mut next = self.next_id.lock().unwrap();
+            let id = *next;
+            *next += 1;
+            id
+        };
+        let mut configs = self.server_configs.lock().unwrap();
+        let mut config = config;
+        config.id = id;
+        configs.push(config);
+        info!("Added server config ID {}", id);
+        id
+    }
+
+    pub fn get_server_configs(&self) -> Vec<ServerConnection> {
+        let configs = self.server_configs.lock().unwrap();
+        configs.clone()
+    }
+
+    pub fn remove_server_config(&self, id: i64) {
+        let mut configs = self.server_configs.lock().unwrap();
+        configs.retain(|c| c.id != id);
+        info!("Removed server config ID {}", id);
+    }
 }
 
-/// Server connection request
+impl Default for AppState {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+// ==================== Type Definitions ====================
+
 #[derive(Debug, Deserialize, Serialize)]
 pub struct ServerConnectionRequest {
     pub name: String,
@@ -71,7 +108,6 @@ pub struct ServerConnectionRequest {
     pub zookeeper_chroot: Option<String>,
 }
 
-/// Topic creation request
 #[derive(Debug, Deserialize, Serialize)]
 pub struct CreateTopicRequest {
     pub name: String,
@@ -80,7 +116,6 @@ pub struct CreateTopicRequest {
     pub replication_factor: i32,
 }
 
-/// Message production request
 #[derive(Debug, Deserialize, Serialize)]
 pub struct ProduceMessageRequest {
     pub topic: String,
@@ -89,7 +124,6 @@ pub struct ProduceMessageRequest {
     pub headers: Option<HashMap<String, String>>,
 }
 
-/// Message response
 #[derive(Debug, Serialize)]
 pub struct KafkaMessageResponse {
     pub topic: Option<String>,
@@ -113,7 +147,6 @@ impl From<KafkaMessage> for KafkaMessageResponse {
     }
 }
 
-/// Topic metadata response
 #[derive(Debug, Serialize)]
 pub struct TopicMetadataResponse {
     pub name: String,
@@ -125,7 +158,6 @@ pub struct TopicMetadataResponse {
     pub partitions: Vec<PartitionInfo>,
 }
 
-/// Partition information
 #[derive(Debug, Serialize)]
 pub struct PartitionInfo {
     pub id: i32,
@@ -134,7 +166,6 @@ pub struct PartitionInfo {
     pub isr: Vec<i32>,
 }
 
-/// Consumer group response
 #[derive(Debug, Serialize)]
 pub struct ConsumerGroupResponse {
     #[serde(rename = "groupId")]
@@ -145,7 +176,6 @@ pub struct ConsumerGroupResponse {
     pub members: Vec<ConsumerMemberResponse>,
 }
 
-/// Consumer member response
 #[derive(Debug, Serialize)]
 pub struct ConsumerMemberResponse {
     #[serde(rename = "memberId")]
@@ -156,23 +186,6 @@ pub struct ConsumerMemberResponse {
     pub client_host: String,
 }
 
-/// Error response
-#[derive(Debug, Serialize)]
-pub struct ErrorResponse {
-    pub error: String,
-    pub message: String,
-}
-
-impl From<anyhow::Error> for ErrorResponse {
-    fn from(err: anyhow::Error) -> Self {
-        Self {
-            error: "Error".to_string(),
-            message: err.to_string(),
-        }
-    }
-}
-
-/// Schema information for frontend
 #[derive(Debug, Serialize)]
 pub struct SchemaInfo {
     pub subject: String,
@@ -195,488 +208,541 @@ impl From<SchemaInfoInternal> for SchemaInfo {
     }
 }
 
-/// Tauri command handlers
-pub struct TauriCommands {
-    state: Arc<AppState>,
+// ==================== Tauri Commands ====================
+
+// --- Server Management ---
+
+#[tauri::command]
+pub fn get_server_connections(state: State<'_, Arc<AppState>>) -> Result<Vec<ServerConnection>, String> {
+    info!("Getting all server connections");
+    Ok(state.get_server_configs())
 }
 
-impl TauriCommands {
-    pub fn new(state: Arc<AppState>) -> Self {
-        Self { state }
+#[tauri::command]
+pub fn add_server_connection(request: ServerConnectionRequest, state: State<'_, Arc<AppState>>) -> Result<i64, String> {
+    info!("Adding server connection: {}", request.name);
+
+    let mut config = ServerConnection::new(0, request.name.clone());
+    config.bootstrap_servers = request.bootstrap_servers.unwrap_or_default();
+    if !config.bootstrap_servers.is_empty() {
+        config.host = config.bootstrap_servers.split(',').next().unwrap_or("").split(':').next().unwrap_or("").to_string();
     }
 
-    // ==================== Server Management Commands ====================
+    let id = state.add_server_config(config);
+    info!("Server added with ID: {}", id);
+    Ok(id)
+}
 
-    /// Get all server connections
-    pub fn get_server_connections(&self) -> Result<Vec<ServerConnectionSettings>> {
-        info!("Getting all server connections");
-        // TODO: Load from configuration
-        Ok(Vec::new())
+#[tauri::command]
+pub fn update_server_connection(id: i64, request: ServerConnectionRequest, state: State<'_, Arc<AppState>>) -> Result<(), String> {
+    info!("Updating server connection ID {}: {}", id, request.name);
+    // TODO: Implement update
+    Ok(())
+}
+
+#[tauri::command]
+pub fn remove_server_connection(id: i64, state: State<'_, Arc<AppState>>) -> Result<(), String> {
+    info!("Removing server connection ID {}", id);
+    state.remove_server_config(id);
+    state.remove_connection(id);
+    Ok(())
+}
+
+#[tauri::command]
+pub fn connect_to_server(id: i64, state: State<'_, Arc<AppState>>) -> Result<(), String> {
+    info!("Connecting to server ID {}", id);
+
+    if state.get_connection(id).is_some() {
+        return Err(format!("Already connected to server ID {}", id));
     }
 
-    /// Add a new server connection
-    pub fn add_server_connection(&self, request: ServerConnectionRequest) -> Result<i64> {
-        info!("Adding server connection: {}", request.name);
+    let conn = ServerConnection::new(id, format!("Server-{}", id));
+    let mapper = KafkaMapper::new(conn).map_err(|e| e.to_string())?;
+    state.add_connection(id, Arc::new(mapper));
 
-        // Create ServerConnection from request
-        let conn = ServerConnection::new(1, request.name.clone());
-        // TODO: Save to configuration
-        // TODO: Create KafkaMapper and add to state
+    info!("Successfully connected to server ID {}", id);
+    Ok(())
+}
 
-        Ok(1)
+#[tauri::command]
+pub fn disconnect_from_server(id: i64, state: State<'_, Arc<AppState>>) -> Result<(), String> {
+    info!("Disconnecting from server ID {}", id);
+
+    if let Some(mapper) = state.get_connection(id) {
+        mapper.close().map_err(|e| e.to_string())?;
+        state.remove_connection(id);
+        info!("Successfully disconnected from server ID {}", id);
+    } else {
+        warn!("Server ID {} was not connected", id);
     }
 
-    /// Update an existing server connection
-    pub fn update_server_connection(&self, id: i64, request: ServerConnectionRequest) -> Result<()> {
-        info!("Updating server connection ID {}: {}", id, request.name);
-        // TODO: Update in configuration
-        // TODO: Recreate KafkaMapper if connected
-        Ok(())
-    }
+    Ok(())
+}
 
-    /// Remove a server connection
-    pub fn remove_server_connection(&self, id: i64) -> Result<()> {
-        info!("Removing server connection ID {}", id);
+// --- Topic Management ---
 
-        // Disconnect if connected
-        if let Some(_mapper) = self.state.get_connection(id) {
-            self.disconnect_from_server(id)?;
-        }
+#[tauri::command]
+pub fn list_topics(server_id: i64, state: State<'_, Arc<AppState>>) -> Result<Vec<String>, String> {
+    info!("Listing topics for server ID {}", server_id);
 
-        self.state.remove_connection(id);
-        // TODO: Remove from configuration
-        Ok(())
-    }
+    let mapper = state
+        .get_connection(server_id)
+        .ok_or_else(|| format!("Not connected to server ID {}", server_id))?;
 
-    /// Connect to a Kafka server
-    pub fn connect_to_server(&self, id: i64) -> Result<()> {
-        info!("Connecting to server ID {}", id);
+    mapper.list_topics().map_err(|e| e.to_string())
+}
 
-        // Check if already connected
-        if self.state.get_connection(id).is_some() {
-            return Err(anyhow!("Already connected to server ID {}", id));
-        }
+#[tauri::command]
+pub fn create_topic(
+    server_id: i64,
+    request: CreateTopicRequest,
+    state: State<'_, Arc<AppState>>,
+) -> Result<(), String> {
+    info!("Creating topic '{}' on server ID {}", request.name, server_id);
 
-        // TODO: Load ServerConnection from configuration
-        let conn = ServerConnection::new(id, format!("Server-{}", id));
+    let mapper = state
+        .get_connection(server_id)
+        .ok_or_else(|| format!("Not connected to server ID {}", server_id))?;
 
-        // Create Kafka mapper
-        let mapper = Arc::new(KafkaMapper::new(conn)?);
-        self.state.add_connection(id, mapper);
+    mapper
+        .create_topic(&request.name, request.partitions, request.replication_factor)
+        .map_err(|e| e.to_string())
+}
 
-        info!("Successfully connected to server ID {}", id);
-        Ok(())
-    }
+#[tauri::command]
+pub fn delete_topic(server_id: i64, topic_name: String, state: State<'_, Arc<AppState>>) -> Result<(), String> {
+    info!("Deleting topic '{}' on server ID {}", topic_name, server_id);
 
-    /// Disconnect from a Kafka server
-    pub fn disconnect_from_server(&self, id: i64) -> Result<()> {
-        info!("Disconnecting from server ID {}", id);
+    let mapper = state
+        .get_connection(server_id)
+        .ok_or_else(|| format!("Not connected to server ID {}", server_id))?;
 
-        if let Some(mapper) = self.state.get_connection(id) {
-            mapper.close()?;
-            self.state.remove_connection(id);
-            info!("Successfully disconnected from server ID {}", id);
+    mapper.delete_topic(&topic_name).map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+pub fn get_topic_metadata(
+    server_id: i64,
+    topic_name: String,
+    state: State<'_, Arc<AppState>>,
+) -> Result<TopicMetadataResponse, String> {
+    info!("Getting metadata for topic '{}' on server ID {}", topic_name, server_id);
+
+    let mapper = state
+        .get_connection(server_id)
+        .ok_or_else(|| format!("Not connected to server ID {}", server_id))?;
+
+    let metadata = mapper.get_topic_metadata(&topic_name).map_err(|e| e.to_string())?;
+
+    Ok(TopicMetadataResponse {
+        name: metadata.name,
+        partition_count: metadata.partitions.len() as i32,
+        replication_factor: if metadata.partitions.is_empty() {
+            0
         } else {
-            warn!("Server ID {} was not connected", id);
-        }
-
-        Ok(())
-    }
-
-    // ==================== Topic Management Commands ====================
-
-    /// List topics for a server
-    pub fn list_topics(&self, server_id: i64) -> Result<Vec<String>> {
-        info!("Listing topics for server ID {}", server_id);
-
-        let mapper = self.state.get_connection(server_id)
-            .ok_or_else(|| anyhow!("Not connected to server ID {}", server_id))?;
-
-        mapper.list_topics()
-    }
-
-    /// Create a new topic
-    pub fn create_topic(&self, server_id: i64, request: CreateTopicRequest) -> Result<()> {
-        info!("Creating topic '{}' on server ID {}", request.name, server_id);
-
-        let mapper = self.state.get_connection(server_id)
-            .ok_or_else(|| anyhow!("Not connected to server ID {}", server_id))?;
-
-        mapper.create_topic(&request.name, request.partitions, request.replication_factor)
-    }
-
-    /// Delete a topic
-    pub fn delete_topic(&self, server_id: i64, topic_name: String) -> Result<()> {
-        info!("Deleting topic '{}' on server ID {}", topic_name, server_id);
-
-        let mapper = self.state.get_connection(server_id)
-            .ok_or_else(|| anyhow!("Not connected to server ID {}", server_id))?;
-
-        mapper.delete_topic(&topic_name)
-    }
-
-    /// Get topic metadata
-    pub fn get_topic_metadata(&self, server_id: i64, topic_name: String) -> Result<TopicMetadataResponse> {
-        info!("Getting metadata for topic '{}' on server ID {}", topic_name, server_id);
-
-        let mapper = self.state.get_connection(server_id)
-            .ok_or_else(|| anyhow!("Not connected to server ID {}", server_id))?;
-
-        let metadata = mapper.get_topic_metadata(&topic_name)?;
-
-        Ok(TopicMetadataResponse {
-            name: metadata.name,
-            partition_count: metadata.partitions.len() as i32,
-            replication_factor: if metadata.partitions.is_empty() { 0 } else { metadata.partitions[0].replicas.len() as i32 },
-            internal: metadata.internal,
-            partitions: metadata.partitions.iter().map(|p| PartitionInfo {
+            metadata.partitions[0].replicas.len() as i32
+        },
+        internal: metadata.internal,
+        partitions: metadata
+            .partitions
+            .iter()
+            .map(|p| PartitionInfo {
                 id: p.id,
                 leader: p.leader,
                 replicas: p.replicas.clone(),
                 isr: p.isr.clone(),
-            }).collect(),
-        })
-    }
+            })
+            .collect(),
+    })
+}
 
-    /// Get topic partitions
-    pub fn get_topic_partitions(&self, server_id: i64, topic_name: String) -> Result<Vec<PartitionInfo>> {
-        info!("Getting partitions for topic '{}' on server ID {}", topic_name, server_id);
+#[tauri::command]
+pub fn get_topic_partitions(
+    server_id: i64,
+    topic_name: String,
+    state: State<'_, Arc<AppState>>,
+) -> Result<Vec<PartitionInfo>, String> {
+    info!("Getting partitions for topic '{}' on server ID {}", topic_name, server_id);
 
-        let mapper = self.state.get_connection(server_id)
-            .ok_or_else(|| anyhow!("Not connected to server ID {}", server_id))?;
+    let mapper = state
+        .get_connection(server_id)
+        .ok_or_else(|| format!("Not connected to server ID {}", server_id))?;
 
-        let metadata = mapper.get_topic_metadata(&topic_name)?;
+    let metadata = mapper.get_topic_metadata(&topic_name).map_err(|e| e.to_string())?;
 
-        Ok(metadata.partitions.iter().map(|p| PartitionInfo {
+    Ok(metadata
+        .partitions
+        .iter()
+        .map(|p| PartitionInfo {
             id: p.id,
             leader: p.leader,
             replicas: p.replicas.clone(),
             isr: p.isr.clone(),
-        }).collect())
+        })
+        .collect())
+}
+
+// --- Message Operations ---
+
+#[tauri::command]
+pub fn consume_messages(
+    server_id: i64,
+    topic: String,
+    partition: Option<i32>,
+    offset: Option<i64>,
+    limit: usize,
+    state: State<'_, Arc<AppState>>,
+) -> Result<Vec<KafkaMessageResponse>, String> {
+    info!(
+        "Consuming messages from topic '{}' on server ID {} (limit: {})",
+        topic, server_id, limit
+    );
+
+    let mapper = state
+        .get_connection(server_id)
+        .ok_or_else(|| format!("Not connected to server ID {}", server_id))?;
+
+    let consumer = mapper.create_consumer("offset-explorer-temp").map_err(|e| e.to_string())?;
+
+    if let Some(p) = partition {
+        let start_offset = offset.unwrap_or(0);
+        consumer.assign(&topic, p, start_offset).map_err(|e| e.to_string())?;
+    } else {
+        consumer.subscribe(&[&topic]).map_err(|e| e.to_string())?;
     }
 
-    // ==================== Message Operation Commands ====================
-
-    /// Consume messages from a topic
-    pub fn consume_messages(
-        &self,
-        server_id: i64,
-        topic: &str,
-        partition: Option<i32>,
-        offset: Option<i64>,
-        limit: usize,
-    ) -> Result<Vec<KafkaMessageResponse>> {
-        info!("Consuming messages from topic '{}' on server ID {} (limit: {})",
-              topic, server_id, limit);
-
-        let mapper = self.state.get_connection(server_id)
-            .ok_or_else(|| anyhow!("Not connected to server ID {}", server_id))?;
-
-        let consumer = mapper.create_consumer("offset-explorer-temp")?;
-
-        // Assign partition if specified
-        if let Some(p) = partition {
-            let start_offset = offset.unwrap_or(0);
-            consumer.assign(topic, p, start_offset)?;
-        } else {
-            consumer.subscribe(&[topic])?;
-        }
-
-        let mut messages = Vec::new();
-        for _ in 0..limit {
-            match consumer.poll(1000)? {
-                Some(msg) => {
-                    messages.push(KafkaMessageResponse::from(msg));
-                }
-                None => break,
+    let mut messages = Vec::new();
+    for _ in 0..limit {
+        match consumer.poll(1000).map_err(|e| e.to_string())? {
+            Some(msg) => {
+                messages.push(KafkaMessageResponse::from(msg));
             }
+            None => break,
         }
-
-        info!("Consumed {} messages", messages.len());
-        Ok(messages)
     }
 
-    /// Produce a message
-    pub fn produce_message(&self, server_id: i64, request: ProduceMessageRequest) -> Result<()> {
-        info!("Producing message to topic '{}' on server ID {}", request.topic, server_id);
+    info!("Consumed {} messages", messages.len());
+    Ok(messages)
+}
 
-        let mapper = self.state.get_connection(server_id)
-            .ok_or_else(|| anyhow!("Not connected to server ID {}", server_id))?;
+#[tauri::command]
+pub fn produce_message(
+    server_id: i64,
+    request: ProduceMessageRequest,
+    state: State<'_, Arc<AppState>>,
+) -> Result<(), String> {
+    info!(
+        "Producing message to topic '{}' on server ID {}",
+        request.topic, server_id
+    );
 
-        let key = request.key.map(|k| k.into_bytes());
-        let value = request.value.map(|v| v.into_bytes());
+    let mapper = state
+        .get_connection(server_id)
+        .ok_or_else(|| format!("Not connected to server ID {}", server_id))?;
 
-        mapper.produce_message(&request.topic, key, value)
-    }
+    let key = request.key.map(|k| k.into_bytes());
+    let value = request.value.map(|v| v.into_bytes());
 
-    // ==================== Consumer Group Commands ====================
+    mapper
+        .produce_message(&request.topic, key, value)
+        .map_err(|e| e.to_string())
+}
 
-    /// List consumer groups
-    pub fn list_consumer_groups(&self, server_id: i64) -> Result<Vec<ConsumerGroupResponse>> {
-        info!("Listing consumer groups for server ID {}", server_id);
+// --- Consumer Groups ---
 
-        let mapper = self.state.get_connection(server_id)
-            .ok_or_else(|| anyhow!("Not connected to server ID {}", server_id))?;
+#[tauri::command]
+pub fn list_consumer_groups(
+    server_id: i64,
+    state: State<'_, Arc<AppState>>,
+) -> Result<Vec<ConsumerGroupResponse>, String> {
+    info!("Listing consumer groups for server ID {}", server_id);
 
-        let groups = mapper.list_consumer_groups()?;
+    let mapper = state
+        .get_connection(server_id)
+        .ok_or_else(|| format!("Not connected to server ID {}", server_id))?;
 
-        Ok(groups.iter().map(|g| ConsumerGroupResponse {
+    let groups = mapper.list_consumer_groups().map_err(|e| e.to_string())?;
+
+    Ok(groups
+        .iter()
+        .map(|g| ConsumerGroupResponse {
             group_id: g.group_id.clone(),
             state: g.state.clone(),
             protocol_type: g.protocol_type.clone(),
-            members: g.members.iter().map(|m| ConsumerMemberResponse {
-                member_id: m.member_id.clone(),
-                client_id: m.client_id.clone(),
-                client_host: m.client_host.clone(),
-            }).collect(),
-        }).collect())
-    }
-
-    /// Get consumer group details
-    pub fn get_consumer_group_details(&self, server_id: i64, group_id: String) -> Result<serde_json::Value> {
-        info!("Getting details for consumer group '{}' on server ID {}", group_id, server_id);
-
-        // Let underscore compiler know we intentionally ignore this
-        let _mapper = self.state.get_connection(server_id)
-            .ok_or_else(|| anyhow!("Not connected to server ID {}", server_id))?;
-
-        // TODO: Implement detailed consumer group info
-        // This would require getting consumer offsets, lag, etc.
-        Ok(serde_json::json!({
-            "groupId": group_id,
-            "state": "Stable",
-            "members": []
-        }))
-    }
-
-    /// Reset consumer offset
-    pub fn reset_consumer_offset(
-        &self,
-        server_id: i64,
-        group_id: String,
-        topic: &str,
-        partition: i32,
-        offset: i64,
-    ) -> Result<()> {
-        info!("Resetting offset for group '{}' topic {} partition {} to {} on server ID {}",
-              group_id, topic, partition, offset, server_id);
-
-        let mapper = self.state.get_connection(server_id)
-            .ok_or_else(|| anyhow!("Not connected to server ID {}", server_id))?;
-
-        let consumer = mapper.create_consumer(&group_id)?;
-        consumer.assign(topic, partition, offset)?;
-        consumer.commit()?;
-
-        info!("Offset reset successfully");
-        Ok(())
-    }
-
-    // ==================== Background Task Commands ====================
-
-    /// Get task progress
-    pub fn get_task_progress(&self, task_id: String) -> Result<crate::async_ops::TaskProgress> {
-        debug!("Getting progress for task: {}", task_id);
-
-        let progress = self.state.task_manager.get_task_progress(&task_id)
-            .ok_or_else(|| anyhow!("Task {} not found", task_id))?;
-
-        Ok(progress)
-    }
-
-    /// Cancel a task
-    pub fn cancel_task(&self, task_id: String) -> Result<()> {
-        info!("Cancelling task: {}", task_id);
-        self.state.task_manager.cancel_task(&task_id)
-    }
-
-    /// List all tasks
-    pub fn list_tasks(&self) -> Result<Vec<String>> {
-        debug!("Listing all tasks");
-        // TODO: Implement task listing
-        Ok(Vec::new())
-    }
-
-    // ==================== Broker Commands ====================
-
-    /// List brokers
-    pub fn list_brokers(&self, server_id: i64) -> Result<Vec<i32>> {
-        info!("Listing brokers for server ID {}", server_id);
-
-        let mapper = self.state.get_connection(server_id)
-            .ok_or_else(|| anyhow!("Not connected to server ID {}", server_id))?;
-
-        mapper.list_brokers()
-    }
-
-    // ==================== ACL Management Commands ====================
-
-    /// List ACL bindings
-    pub fn list_acls(&self, server_id: i64, filter: Option<AclFilter>) -> Result<Vec<AclBinding>> {
-        info!("Listing ACLs for server ID {}", server_id);
-
-        let mapper = self.state.get_connection(server_id)
-            .ok_or_else(|| anyhow!("Not connected to server ID {}", server_id))?;
-
-        mapper.list_acls(filter)
-    }
-
-    /// Create a new ACL
-    pub fn create_acl(&self, server_id: i64, request: CreateAclRequest) -> Result<()> {
-        info!("Creating ACL on server ID {}: {:?}", server_id, request);
-
-        // Validate request
-        request.validate()?;
-
-        let mapper = self.state.get_connection(server_id)
-            .ok_or_else(|| anyhow!("Not connected to server ID {}", server_id))?;
-
-        mapper.create_acl(&request)
-    }
-
-    /// Delete an ACL
-    pub fn delete_acl(
-        &self,
-        server_id: i64,
-        principal: String,
-        resource_type: String,
-        resource_name: String,
-        operation: String,
-        permission_type: String,
-        host: String,
-    ) -> Result<()> {
-        info!("Deleting ACL on server ID {}: {}={} on {}",
-              server_id, principal, operation, resource_name);
-
-        let mapper = self.state.get_connection(server_id)
-            .ok_or_else(|| anyhow!("Not connected to server ID {}", server_id))?;
-
-        mapper.delete_acl(&principal, &resource_type, &resource_name, &operation, &permission_type, &host)
-    }
-
-    // ==================== Schema Registry Commands ====================
-
-    /// List all subjects in Schema Registry
-    pub fn list_schema_subjects(&self, registry_url: String) -> Result<Vec<String>> {
-        info!("Listing Schema Registry subjects");
-
-        let rt = tokio::runtime::Runtime::new()
-            .map_err(|e| anyhow!("Failed to create runtime: {}", e))?;
-
-        let client = SchemaRegistryClient::new(registry_url)
-            .map_err(|e| anyhow!("Failed to create client: {}", e))?;
-        let subjects = rt.block_on(async {
-            client.get_subjects().await
-        }).map_err(|e| anyhow!("Failed to list subjects: {}", e))?;
-
-        Ok(subjects)
-    }
-
-    /// Get a specific schema from Schema Registry
-    pub fn get_schema(&self, registry_url: String, subject: String, version: i32) -> Result<SchemaInfo> {
-        info!("Getting schema {} version {} from {}", subject, version, registry_url);
-
-        let rt = tokio::runtime::Runtime::new()
-            .map_err(|e| anyhow!("Failed to create runtime: {}", e))?;
-
-        let client = SchemaRegistryClient::new(registry_url)
-            .map_err(|e| anyhow!("Failed to create client: {}", e))?;
-        let schema_info = rt.block_on(async {
-            client.get_schema(&subject, version).await
-        }).map_err(|e| anyhow!("Failed to get schema: {}", e))?;
-
-        Ok(schema_info.into())
-    }
-
-    /// Get the latest schema for a subject
-    pub fn get_latest_schema(&self, registry_url: String, subject: String) -> Result<SchemaInfo> {
-        info!("Getting latest schema for {} from {}", subject, registry_url);
-
-        let rt = tokio::runtime::Runtime::new()
-            .map_err(|e| anyhow!("Failed to create runtime: {}", e))?;
-
-        let client = SchemaRegistryClient::new(registry_url)
-            .map_err(|e| anyhow!("Failed to create client: {}", e))?;
-        let schema_info = rt.block_on(async {
-            client.get_latest_schema(&subject).await
-        }).map_err(|e| anyhow!("Failed to get latest schema: {}", e))?;
-
-        Ok(schema_info.into())
-    }
-
-    /// Register a new schema in Schema Registry
-    pub fn register_schema(&self, registry_url: String, subject: String, schema: String, schema_type: String) -> Result<i32> {
-        info!("Registering new schema for {} in {}", subject, registry_url);
-
-        let rt = tokio::runtime::Runtime::new()
-            .map_err(|e| anyhow!("Failed to create runtime: {}", e))?;
-
-        let client = SchemaRegistryClient::new(registry_url)
-            .map_err(|e| anyhow!("Failed to create client: {}", e))?;
-        let schema_type_enum = match schema_type.as_str() {
-            "AVRO" => SchemaType::AVRO,
-            "PROTOBUF" => SchemaType::PROTOBUF,
-            "JSON" => SchemaType::JSON,
-            _ => return Err(anyhow!("Invalid schema type: {}", schema_type)),
-        };
-
-        let id = rt.block_on(async {
-            client.register_schema(&subject, &schema, schema_type_enum).await
-        }).map_err(|e| anyhow!("Failed to register schema: {}", e))?;
-
-        info!("Registered schema with ID: {}", id);
-        Ok(id)
-    }
-
-    /// Test schema compatibility
-    pub fn test_compatibility(&self, registry_url: String, subject: String, schema: String, schema_type: String) -> Result<bool> {
-        info!("Testing compatibility for {} in {}", subject, registry_url);
-
-        let rt = tokio::runtime::Runtime::new()
-            .map_err(|e| anyhow!("Failed to create runtime: {}", e))?;
-
-        let client = SchemaRegistryClient::new(registry_url)
-            .map_err(|e| anyhow!("Failed to create client: {}", e))?;
-        let schema_type_enum = match schema_type.as_str() {
-            "AVRO" => SchemaType::AVRO,
-            "PROTOBUF" => SchemaType::PROTOBUF,
-            "JSON" => SchemaType::JSON,
-            _ => return Err(anyhow!("Invalid schema type: {}", schema_type)),
-        };
-
-        let is_compatible = rt.block_on(async {
-            client.check_compatibility(&subject, &schema, schema_type_enum).await
-        }).map_err(|e| anyhow!("Failed to check compatibility: {}", e))?;
-
-        Ok(is_compatible)
-    }
+            members: g
+                .members
+                .iter()
+                .map(|m| ConsumerMemberResponse {
+                    member_id: m.member_id.clone(),
+                    client_id: m.client_id.clone(),
+                    client_host: m.client_host.clone(),
+                })
+                .collect(),
+        })
+        .collect())
 }
+
+#[tauri::command]
+pub fn get_consumer_group_details(
+    server_id: i64,
+    group_id: String,
+    state: State<'_, Arc<AppState>>,
+) -> Result<serde_json::Value, String> {
+    info!(
+        "Getting details for consumer group '{}' on server ID {}",
+        group_id, server_id
+    );
+
+    let _mapper = state
+        .get_connection(server_id)
+        .ok_or_else(|| format!("Not connected to server ID {}", server_id))?;
+
+    Ok(serde_json::json!({
+        "groupId": group_id,
+        "state": "Stable",
+        "members": []
+    }))
+}
+
+#[tauri::command]
+pub fn reset_consumer_offset(
+    server_id: i64,
+    group_id: String,
+    topic: String,
+    partition: i32,
+    offset: i64,
+    state: State<'_, Arc<AppState>>,
+) -> Result<(), String> {
+    info!(
+        "Resetting offset for group '{}' topic {} partition {} to {}",
+        group_id, topic, partition, offset
+    );
+
+    let mapper = state
+        .get_connection(server_id)
+        .ok_or_else(|| format!("Not connected to server ID {}", server_id))?;
+
+    let consumer = mapper.create_consumer(&group_id).map_err(|e| e.to_string())?;
+    consumer
+        .assign(&topic, partition, offset)
+        .map_err(|e| e.to_string())?;
+    consumer.commit().map_err(|e| e.to_string())?;
+
+    info!("Offset reset successfully");
+    Ok(())
+}
+
+// --- Tasks ---
+
+#[tauri::command]
+pub fn get_task_progress(
+    task_id: String,
+    state: State<'_, Arc<AppState>>,
+) -> Result<crate::async_ops::TaskProgress, String> {
+    debug!("Getting progress for task: {}", task_id);
+
+    let progress = state
+        .task_manager
+        .get_task_progress(&task_id)
+        .ok_or_else(|| format!("Task {} not found", task_id))?;
+
+    Ok(progress)
+}
+
+#[tauri::command]
+pub fn cancel_task(task_id: String, state: State<'_, Arc<AppState>>) -> Result<(), String> {
+    info!("Cancelling task: {}", task_id);
+    state.task_manager.cancel_task(&task_id).map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+pub fn list_tasks() -> Result<Vec<String>, String> {
+    debug!("Listing all tasks");
+    Ok(Vec::new())
+}
+
+// --- Brokers ---
+
+#[tauri::command]
+pub fn list_brokers(server_id: i64, state: State<'_, Arc<AppState>>) -> Result<Vec<i32>, String> {
+    info!("Listing brokers for server ID {}", server_id);
+
+    let mapper = state
+        .get_connection(server_id)
+        .ok_or_else(|| format!("Not connected to server ID {}", server_id))?;
+
+    mapper.list_brokers().map_err(|e| e.to_string())
+}
+
+// --- ACLs ---
+
+#[tauri::command]
+pub fn list_acls(
+    server_id: i64,
+    filter: Option<AclFilter>,
+    state: State<'_, Arc<AppState>>,
+) -> Result<Vec<AclBinding>, String> {
+    info!("Listing ACLs for server ID {}", server_id);
+
+    let mapper = state
+        .get_connection(server_id)
+        .ok_or_else(|| format!("Not connected to server ID {}", server_id))?;
+
+    mapper.list_acls(filter).map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+pub fn create_acl(
+    server_id: i64,
+    request: CreateAclRequest,
+    state: State<'_, Arc<AppState>>,
+) -> Result<(), String> {
+    info!("Creating ACL on server ID {}", server_id);
+
+    request.validate().map_err(|e| e.to_string())?;
+
+    let mapper = state
+        .get_connection(server_id)
+        .ok_or_else(|| format!("Not connected to server ID {}", server_id))?;
+
+    mapper.create_acl(&request).map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+pub fn delete_acl(
+    server_id: i64,
+    principal: String,
+    resource_type: String,
+    resource_name: String,
+    operation: String,
+    permission_type: String,
+    host: String,
+    state: State<'_, Arc<AppState>>,
+) -> Result<(), String> {
+    info!("Deleting ACL on server ID {}", server_id);
+
+    let mapper = state
+        .get_connection(server_id)
+        .ok_or_else(|| format!("Not connected to server ID {}", server_id))?;
+
+    mapper
+        .delete_acl(
+            &principal,
+            &resource_type,
+            &resource_name,
+            &operation,
+            &permission_type,
+            &host,
+        )
+        .map_err(|e| e.to_string())
+}
+
+// --- Schema Registry ---
+
+#[tauri::command]
+pub fn list_schema_subjects(registry_url: String) -> Result<Vec<String>, String> {
+    info!("Listing Schema Registry subjects");
+
+    let rt = tokio::runtime::Runtime::new().map_err(|e| format!("Failed to create runtime: {}", e))?;
+
+    let client =
+        SchemaRegistryClient::new(registry_url).map_err(|e| format!("Failed to create client: {}", e))?;
+
+    rt.block_on(async { client.get_subjects().await })
+        .map_err(|e| format!("Failed to list subjects: {}", e))
+}
+
+#[tauri::command]
+pub fn get_schema(
+    registry_url: String,
+    subject: String,
+    version: i32,
+) -> Result<SchemaInfo, String> {
+    info!("Getting schema {} version {}", subject, version);
+
+    let rt = tokio::runtime::Runtime::new().map_err(|e| format!("Failed to create runtime: {}", e))?;
+
+    let client =
+        SchemaRegistryClient::new(registry_url).map_err(|e| format!("Failed to create client: {}", e))?;
+
+    rt.block_on(async { client.get_schema(&subject, version).await })
+        .map(|info| info.into())
+        .map_err(|e| format!("Failed to get schema: {}", e))
+}
+
+#[tauri::command]
+pub fn get_latest_schema(registry_url: String, subject: String) -> Result<SchemaInfo, String> {
+    info!("Getting latest schema for {}", subject);
+
+    let rt = tokio::runtime::Runtime::new().map_err(|e| format!("Failed to create runtime: {}", e))?;
+
+    let client =
+        SchemaRegistryClient::new(registry_url).map_err(|e| format!("Failed to create client: {}", e))?;
+
+    rt.block_on(async { client.get_latest_schema(&subject).await })
+        .map(|info| info.into())
+        .map_err(|e| format!("Failed to get schema: {}", e))
+}
+
+#[tauri::command]
+pub fn register_schema(
+    registry_url: String,
+    subject: String,
+    schema: String,
+    schema_type: String,
+) -> Result<i32, String> {
+    info!("Registering schema for {}", subject);
+
+    let rt = tokio::runtime::Runtime::new().map_err(|e| format!("Failed to create runtime: {}", e))?;
+
+    let client =
+        SchemaRegistryClient::new(registry_url).map_err(|e| format!("Failed to create client: {}", e))?;
+
+    let schema_type_enum = match schema_type.as_str() {
+        "AVRO" => SchemaType::AVRO,
+        "PROTOBUF" => SchemaType::PROTOBUF,
+        "JSON" => SchemaType::JSON,
+        _ => return Err(format!("Invalid schema type: {}", schema_type)),
+    };
+
+    rt.block_on(async { client.register_schema(&subject, &schema, schema_type_enum).await })
+        .map_err(|e| format!("Failed to register schema: {}", e))
+}
+
+#[tauri::command]
+pub fn test_compatibility(
+    registry_url: String,
+    subject: String,
+    schema: String,
+    schema_type: String,
+) -> Result<bool, String> {
+    info!("Testing compatibility for {}", subject);
+
+    let rt = tokio::runtime::Runtime::new().map_err(|e| format!("Failed to create runtime: {}", e))?;
+
+    let client =
+        SchemaRegistryClient::new(registry_url).map_err(|e| format!("Failed to create client: {}", e))?;
+
+    let schema_type_enum = match schema_type.as_str() {
+        "AVRO" => SchemaType::AVRO,
+        "PROTOBUF" => SchemaType::PROTOBUF,
+        "JSON" => SchemaType::JSON,
+        _ => return Err(format!("Invalid schema type: {}", schema_type)),
+    };
+
+    rt.block_on(async { client.check_compatibility(&subject, &schema, schema_type_enum).await })
+        .map_err(|e| format!("Failed to check compatibility: {}", e))
+}
+
+// ==================== Tests ====================
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
     #[test]
-    fn test_error_response_conversion() {
-        let err = anyhow!("Test error");
-        let response: ErrorResponse = err.into();
-        assert_eq!(response.error, "Error");
-    }
-
-    #[test]
-    fn test_kafka_message_conversion() {
-        let kafka_msg = KafkaMessage {
-            topic: Some("test-topic".to_string()),
-            partition: 0,
-            offset: 123,
-            key: Some(b"key".to_vec()),
-            payload: Some(b"value".to_vec()),
-            timestamp: 123456789,
-        };
-
-        let response: KafkaMessageResponse = kafka_msg.into();
-        assert_eq!(response.topic, Some("test-topic".to_string()));
-        assert_eq!(response.partition, 0);
-        assert_eq!(response.offset, 123);
+    fn test_app_state_new() {
+        let state = AppState::new();
+        assert!(state.get_connection(1).is_none());
     }
 }
